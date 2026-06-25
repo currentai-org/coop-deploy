@@ -21,14 +21,14 @@ jobs:
       run:
         working-directory: terraform
     steps:
+      - uses: actions/checkout@v4
+
       - name: Verify Confirmation
         run: |
           if [ "${{ github.event.inputs.confirm }}" != "destroy" ]; then
             echo "Confirmation failed. Expected 'destroy', got '${{ github.event.inputs.confirm }}'."
             exit 1
           fi
-
-      - uses: actions/checkout@v4
 
       - uses: aws-actions/configure-aws-credentials@v4
         with:
