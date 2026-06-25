@@ -45,6 +45,24 @@ resource "aws_subnet" "public_zone_2" {
   }
 }
 
+# Look up the existing public route table
+data "aws_route_table" "public" {
+  filter {
+    name   = "tag:Name"
+    values = ["publicai-rtb-public"]
+  }
+}
+# Associate subnet 1
+resource "aws_route_table_association" "public_zone_1" {
+  subnet_id      = aws_subnet.public_zone_1.id
+  route_table_id = data.aws_route_table.public.id
+}
+# Associate subnet 2
+resource "aws_route_table_association" "public_zone_2" {
+  subnet_id      = aws_subnet.public_zone_2.id
+  route_table_id = data.aws_route_table.public.id
+}
+
 
 data "aws_ami" "amazon_ubuntu" {
   most_recent = true
