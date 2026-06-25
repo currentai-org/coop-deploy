@@ -22,7 +22,7 @@ resource "aws_acm_certificate" "cert" {
 #
 resource "aws_subnet" "public_zone_1" {
   vpc_id                  = data.aws_vpc.default.id
-  cidr_block              = "10.0.0.0/20"
+  cidr_block              = "10.0.1.0/20"
   availability_zone       = local.zone1
   map_public_ip_on_launch = true
   tags = {
@@ -32,7 +32,7 @@ resource "aws_subnet" "public_zone_1" {
 
 resource "aws_subnet" "public_zone_2" {
   vpc_id                  = data.aws_vpc.default.id
-  cidr_block              = "10.0.16.0/20"
+  cidr_block              = "10.0.17.0/20"
   availability_zone       = local.zone2
   map_public_ip_on_launch = true
   tags = {
