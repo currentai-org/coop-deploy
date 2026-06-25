@@ -10,7 +10,7 @@ terraform {
 
   # remote state configuration here
   backend "s3" {
-    bucket         = "coop-deploy-terraform" # update this to bucket name from terraform-remote-state
+    bucket         = "coop-terraform-state-currentai" # update this to bucket name from terraform-remote-state
     key            = "infra/terraform.tfstate"
     region         = "eu-central-2" # update this to match region in 0-locals.tf
     dynamodb_table = "terraform-state"
