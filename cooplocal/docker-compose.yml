@@ -1,0 +1,205 @@
+# Vanilla Coop stack — STOCK coop-server, run locally in Docker. No derived image, no
+# plugin baking: the custom Guardrails integration was removed. The chat app screens
+# content/child via Coop's own rules (user-managed Zentropi signals) and screens
+# prompt-injection in-app (deberta). Coop's own repo files are NOT modified.
+#
+# Bring the stack up (no build step — stock images are pulled by digest):
+#   npm run coop:up      # docker compose -f coop/docker-compose.yml up -d
+#
+# Ports (host): postgres 5433, coop server 8080, coop dashboard 3000, audit sink 9090.
+# scylla(9042)/clickhouse(8123) are internal-only and unused by the /content rules
+# path — present because the published migrations/server images expect them.
+#
+# RAM: scylla alone wants ~4G; budget ~8G for Docker.
+#
+# Image pinning (reproducible deploys): every PULLED image is pinned to a content digest
+# (@sha256:...) with its human tag in a trailing comment, so a redeploy is repeatable.
+# The ONLY locally-built image is coop-audit-sink:local (build: ./audit-sink); its FROM
+# base is digest-pinned in audit-sink/Dockerfile.
+# To refresh a pulled pin after an intentional upgrade, pull the tag and read the digest:
+#   docker pull ghcr.io/roostorg/coop-client:latest
+#   docker image inspect ghcr.io/roostorg/coop-client:latest --format '{{join .RepoDigests "\n"}}'
+# then paste the new @sha256 here.
+#
+# Zentropi one-file patch (G1): the pinned stock coop-server's compiled Zentropi signal
+# POSTs the request field `labeler_version_id`, but the Zentropi /v1/label API expects
+# `labeler_id`. We correct that with a read-only BIND-MOUNT of patches/zentropiUtils.js
+# over the stock path on the `server` service (below) — keeping the image stock (no
+# rebuild) while fixing the field. Drop the mount once a stock image ships the fix.
+#
+# Port bindings: all host-published ports bind to ${COOP_BIND_ADDR:-127.0.0.1} so the
+# API (8080) and dashboard (3000) are loopback-only by default. To expose on a trusted
+# host, run with COOP_BIND_ADDR=0.0.0.0 (or a specific interface IP).
+
+# NOTE: project name kept as coop-guardrails (legacy) so `npm run coop:down` still tears
+# down an existing local stack and its named volumes; cosmetic only (no guardrails remain).
+name: coop-guardrails
+
+services:
+  postgres:
+    image: postgres@sha256:8f70a8af16acc7c86e663ceda3dd95c41f036363c5b3c184650640ac20e7988b # postgres:15.18
+    container_name: cg-postgres
+    restart: unless-stopped
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      # Host 5433 to avoid clashing with the chat app's own postgres on 5432.
+      # Internal stays 5432, so Coop's services (which use the Docker network) are
+      # unaffected. Connect from the host with: psql -h localhost -p 5433 -U postgres
+      - '${COOP_BIND_ADDR:-127.0.0.1}:5433:5432'
+    healthcheck:
+      test: ['CMD', 'pg_isready', '-U', 'postgres', '-d', 'postgres']
+      interval: 2s
+      start_period: 2s
+    environment:
+      POSTGRES_PASSWORD: postgres123
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+
+  redis:
+    image: redis@sha256:315270d166080f537bbdf1b489b603aaaa213cb55a544acfa51feb7481abb1c0 # redis:8.6.1-trixie
+    container_name: cg-redis
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - 'yes'
+      - --maxmemory
+      - '256mb'
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redis_data:/data
+
+  scylla:
+    image: scylladb/scylla@sha256:2824c99f8395f679121cfb9c4eccab872ffc39cbf989960f6c2859d8a819ea44 # scylladb/scylla:5.2
+    container_name: cg-scylla
+    command: --smp 1 --memory 4G --overprovisioned 1 --developer-mode 1
+    volumes:
+      - scylla_data:/var/lib/scylla
+    healthcheck:
+      # Connect to the container's CURRENT ip ($(hostname -i)) — scylla listens on its container
+      # IP, not loopback, and the IP changes across recreates. A bare `cqlsh` picks up a stale
+      # pinned hostname from /root/.cqlshrc (a previous run's IP) and false-negatives even though
+      # scylla is serving; the explicit current-IP host overrides that and is recreate-proof.
+      test: ['CMD-SHELL', 'cqlsh $(hostname -i) -e "SELECT release_version FROM system.local" || exit 1']
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 35s
+
+  clickhouse:
+    image: clickhouse/clickhouse-server@sha256:85b97f63dcfff47790d26bb5d5801637aaddb2b93e5e9aee27a686c2fb2b9916 # clickhouse/clickhouse-server:24.3
+    container_name: cg-clickhouse
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    environment:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: clickhouse
+    healthcheck:
+      test: ['CMD-SHELL', 'clickhouse-client --host localhost --query "SELECT 1"']
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # One-shot: applies all migrations against the three DBs, then exits.
+  migrations:
+    image: ghcr.io/roostorg/coop-migrations@sha256:1d26d23e13c1577ec99dc65ad02f1e415e2599571f290da11a69ec81f5f9033d # ghcr.io/roostorg/coop-migrations:latest
+    container_name: cg-migrations
+    command: sh -c 'set -e
+      && for db in api-server-pg scylla clickhouse; do npm run db:create -- --db "$$db" --env staging; npm run db:update -- --db "$$db" --env staging; done'
+    env_file: ./coop.env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      scylla:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  # One-shot: creates the org + admin user (fixed email), prints credentials +
+  # API key to stdout. On re-run it skips (duplicate key). Stock server image —
+  # bin/create-org-and-user.js ships in it (verified at the pinned digest).
+  seed:
+    image: ghcr.io/roostorg/coop-server@sha256:cf917c7e311c44cba4b67251eed0e7ae9e1da3164620989331ef2628e2c4d325 # ghcr.io/roostorg/coop-server:latest
+    container_name: cg-seed
+    entrypoint: ['sh', '-c']
+    command:
+      - |
+        OUTPUT=$$(node bin/create-org-and-user.js \
+          --name "Coop" \
+          --email "$$COOP_ADMIN_EMAIL" \
+          --website "https://coop.local" \
+          --firstName "Admin" \
+          --lastName "User" \
+          --password "$$COOP_ADMIN_PASSWORD" 2>&1) \
+        && echo "$$OUTPUT" \
+        && echo "" \
+        && echo "============================================" \
+        && echo "  Login:    $$COOP_ADMIN_EMAIL" \
+        && echo "  Password: $$COOP_ADMIN_PASSWORD" \
+        && echo "============================================" \
+        || { echo "$$OUTPUT"; echo "$$OUTPUT" | grep -q "duplicate key" && echo "Seed user already exists — skipping." || exit 1; }
+    env_file: ./coop.env
+    environment:
+      NODE_ENV: development
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+
+  # The stock Coop API server. No integration baked in — content/child rules use the
+  # user's Zentropi signals; injection is screened in-app (deberta). The single bind-mount
+  # below is the G1 Zentropi field-name fix (labeler_version_id -> labeler_id), applied
+  # over the stock file at runtime so the image stays stock (no rebuild).
+  server:
+    image: ghcr.io/roostorg/coop-server@sha256:cf917c7e311c44cba4b67251eed0e7ae9e1da3164620989331ef2628e2c4d325 # ghcr.io/roostorg/coop-server:latest
+    container_name: cg-server
+    restart: unless-stopped
+    ports:
+      - '${COOP_BIND_ADDR:-127.0.0.1}:8081:8080'
+    env_file: ./coop.env
+    volumes:
+      # G1 one-file patch: fix the Zentropi request field name in the stock server's
+      # compiled signal code. Read-only overlay; see the header note. Drop when upstream fixes it.
+      - ./patches/zentropiUtils.js:/app/services/signalsService/signals/third_party_signals/zentropi/zentropiUtils.js:ro
+    environment:
+      NODE_ENV: development
+      PORT: '8080'
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+      audit-sink:
+        # healthy (not just started) so the sink accepts connections before any
+        # rule fires its chat-block callback (which Coop awaits within the 24s budget).
+        condition: service_healthy
+
+  # Coop dashboard (optional, for manual inspection of rules/actions/item types).
+  client:
+    image: ghcr.io/roostorg/coop-client@sha256:651dc493178dd685c43951e9701031d051e6e6fc1a0852fe69939020caa17fd6 # ghcr.io/roostorg/coop-client:latest
+    container_name: cg-client
+    restart: unless-stopped
+    ports:
+      - '${COOP_BIND_ADDR:-127.0.0.1}:3000:80'
+
+  # Instant-200 callback target for the chat-block CUSTOM_ACTION (audit only).
+  audit-sink:
+    build:
+      context: ./audit-sink
+    image: coop-audit-sink:local
+    container_name: cg-audit-sink
+    restart: unless-stopped
+    environment:
+      PORT: '9090'
+    ports:
+      - '${COOP_BIND_ADDR:-127.0.0.1}:9090:9090'
+
+volumes:
+  pg_data:
+  redis_data:
+  scylla_data:
+  clickhouse_data:

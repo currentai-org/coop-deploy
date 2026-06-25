@@ -1,0 +1,1 @@
+This deploys https://github.com/roostorg/coop to AWS via terrafrom and GH Actions.
