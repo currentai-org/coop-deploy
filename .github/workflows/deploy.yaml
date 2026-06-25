@@ -1,4 +1,4 @@
-name: Terraform Staging
+name: Deploy TF&Docker
 
 on:
   push:
