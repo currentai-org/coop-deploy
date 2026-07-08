@@ -1,9 +1,8 @@
 name: Diagnose (read-only)
 
-# READ-ONLY diagnostic. Manually triggered. SSHes to the EC2 host with the same secrets the deploy
-# uses, then runs ONLY read commands (docker ps / inspect / logs / exec cat|grep|env). It does NOT run
-# up/down/restart/--build and changes NO container or config state. Purpose: locate the retry loop that
-# storms Zentropi on the async/inline signal-execution path.
+# READ-ONLY diagnostic. Manually triggered. SSHes with the deploy secrets and runs ONLY reads
+# (docker exec cat|grep). NO up/down/restart/build; changes nothing. Purpose: dump the retry logic in
+# the fetcher/executor that wraps the Zentropi call (the async/inline retry storm source).
 
 on:
   workflow_dispatch: {}
@@ -17,16 +16,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: eu-central-2
-
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-
       - name: Retrieve Terraform Outputs
         run: |
           cd terraform
@@ -35,23 +31,17 @@ jobs:
           echo "SERVER_IP=$SERVER_IP" >> "$GITHUB_ENV"
           terraform output -raw private_key > ../private_key.pem
           chmod 600 ../private_key.pem
-
-      - name: Read-only signal-executor inspection
+      - name: Dump fetcher + executor retry logic
         run: |
           ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP '
             set +e
-            echo "=== integrations.config.json ==="
-            sudo docker exec cg-server cat /app/integrations.config.json 2>/dev/null | head -80
-            echo
-            echo "=== relevant runtime env (queue/retry/zentropi) ==="
-            sudo docker exec cg-server sh -c "env | grep -iE \"QUEUE|RETRY|ATTEMPT|BACKOFF|CONCURREN|ZENTROPI|SIGNAL\"" 2>/dev/null
-            echo
-            echo "=== files under /app/services that reference retry/attempts/backoff ==="
-            sudo docker exec cg-server sh -c "grep -rlniE \"maxRetries|numRetries|[^a-z]retries|backoff|attempts|retryable|p-retry|requeue\" /app/services /app/utils 2>/dev/null | head -20"
-            echo
-            echo "=== files that call the zentropi labeler / third-party signals ==="
-            sudo docker exec cg-server sh -c "grep -rlnE \"runZentropiLabelerImpl|getZentropiScores|third_party_signals|runLabeler|executeSignal|evaluateSignal\" /app/services 2>/dev/null | head -20"
-            echo
-            echo "=== makeSignalPermanentError: definition + whether executor checks it ==="
-            sudo docker exec cg-server sh -c "grep -rnE \"makeSignalPermanentError|isPermanent|permanentError|shouldRetry|SignalPermanent\" /app/utils /app/services 2>/dev/null | head -30"
+            F=/app/services/signalsService/helpers/makeCachedFetchers.js
+            E=/app/services/orgAwareSignalExecutionService/signalExecutionService.js
+            Z=/app/services/signalsService/signals/third_party_signals/zentropi/ZentropiLabelerSignal.js
+            echo "############ makeCachedFetchers.js (FULL) ############"
+            sudo docker exec cg-server cat $F 2>/dev/null
+            echo; echo "############ signalExecutionService.js: retry/permanent lines + context ############"
+            sudo docker exec cg-server grep -nE "retry|retries|attempt|backoff|Permanent|shouldRetry|catch|while|for \(|maxRetries|429|5[0-9][0-9]" $E 2>/dev/null | head -60
+            echo; echo "############ ZentropiLabelerSignal.js: how it builds/calls the fetcher ############"
+            sudo docker exec cg-server grep -nE "fetch|CachedFetcher|makeCached|getZentropiScores|retry|timeout" $Z 2>/dev/null | head -40
           '
