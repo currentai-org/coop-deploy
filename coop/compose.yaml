@@ -157,6 +157,15 @@ services:
   nginx:
     image: nginx:alpine
     container_name: cg-nginx
+    labels:
+      # nginx.conf uses STATIC `upstream cg-server`/`cg-client` blocks with NO `resolver`, so nginx
+      # resolves those container names to IPs ONCE at startup and caches them. When cg-server is
+      # recreated (see its coop.zentropi-patch-rev label) it gets a NEW container IP, and nginx keeps
+      # proxying to the STALE IP -> 502 on /api and /graphql (v0.0.8 incident). So nginx MUST be
+      # recreated whenever cg-server is: keep this rev IN LOCKSTEP with the server's zentropi-patch-rev
+      # so a single `up -d` recreates both and nginx re-resolves. (Proper long-term fix: add a Docker
+      # `resolver 127.0.0.11 valid=10s;` + variable proxy_pass so nginx re-resolves at runtime.)
+      coop.upstream-rev: '2'
     ports:
       - "80:80"
     volumes:
