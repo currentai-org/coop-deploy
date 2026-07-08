@@ -175,6 +175,14 @@ services:
     image: ghcr.io/roostorg/coop-server@sha256:cf917c7e311c44cba4b67251eed0e7ae9e1da3164620989331ef2628e2c4d325 # ghcr.io/roostorg/coop-server:latest
     container_name: cg-server
     restart: unless-stopped
+    labels:
+      # The Zentropi fix lives in a read-only BIND MOUNT (patches/zentropiUtils.js below), and Node
+      # caches the module at process start — so replacing the file on disk does NOT take effect until
+      # cg-server is RECREATED. `docker compose up -d` only recreates a service whose config CHANGED,
+      # and a bind-mounted file's *content* is not part of that config. BUMP this rev whenever
+      # patches/zentropiUtils.js changes: it alters the service config hash so the deploy's `up -d`
+      # recreates cg-server (only this container) and reloads the patch. rev 2 = 429/5xx no-retry fix.
+      coop.zentropi-patch-rev: '2'
     ports:
       - '${COOP_BIND_ADDR:-0.0.0.0}:8080:8080'
     env_file: ./coop.env

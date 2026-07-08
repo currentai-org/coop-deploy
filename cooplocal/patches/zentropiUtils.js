@@ -22,6 +22,18 @@ export async function getZentropiScores(fetchHTTP, params) {
                 ? ' (invalid labeler_id)'
                 : ' (invalid API key)'}`, { shouldErrorSpan: true });
         }
+        // Incident 2026-07-07: a 429 (rate limit) or 5xx here threw a *retryable* Error, and Coop's
+        // signal framework retries it with no backoff — turning one rate-limit into a self-sustaining
+        // retry storm that pinned Zentropi at its limit (and it never self-heals: the retries keep
+        // generating fresh 429s). Treat rate-limit / server errors as PERMANENT for this evaluation:
+        // the signal fails once (Coop's fail policy handles the missing score, exactly as when Zentropi
+        // is unreachable) instead of hammering the API. The NEXT message is still a fresh single call,
+        // so the labeler recovers naturally once the limit clears — it is not disabled.
+        if (response.status === 429 || response.status >= 500) {
+            throw makeSignalPermanentError(`Zentropi API error: ${response.status}${response.status === 429
+                ? ' (rate limited)'
+                : ' (server error)'}`, { shouldErrorSpan: true });
+        }
         throw new Error(`Zentropi API error: ${response.status}`);
     }
     return response.body;
