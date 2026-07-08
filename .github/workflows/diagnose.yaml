@@ -1,7 +1,9 @@
 name: Diagnose (read-only)
 
-# READ-ONLY. Manual. SSH + docker logs/grep only. No up/down/restart/build. Reads cg-server logs to
-# confirm the recent Zentropi error status (429 vs other).
+# READ-ONLY probe. Makes ONE bare HTTP request to Zentropi FROM the EC2 host (the same egress IP that
+# "test rule" uses) to read the status + rate-limit headers. No auth key, empty body — this cannot label
+# or change anything; it only reveals whether the EC2 IP is being 429'd (per-IP throttle) vs 401 (not).
+# Changes nothing on the box or in Coop.
 
 on:
   workflow_dispatch: {}
@@ -30,13 +32,11 @@ jobs:
           echo "SERVER_IP=$SERVER_IP" >> "$GITHUB_ENV"
           terraform output -raw private_key > ../private_key.pem
           chmod 600 ../private_key.pem
-      - name: Read cg-server logs for recent Zentropi status
+      - name: Probe Zentropi from the EC2 egress IP
         run: |
-          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP '
-            set +e
-            echo "=== last 1500 log lines: Zentropi / 429 / rate / label / error matches ==="
-            sudo docker logs --tail 1500 cg-server 2>&1 | grep -iE "zentropi|429|rate.?limit|/v1/label|SignalPermanent|Zentropi API error|too many" | tail -40
-            echo
-            echo "=== count of Zentropi-error lines by status in that window ==="
-            sudo docker logs --tail 1500 cg-server 2>&1 | grep -oiE "Zentropi API error: [0-9]{3}[^\"]*" | sort | uniq -c | sort -rn | head
-          '
+          echo "=== EC2 public egress IP ==="
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP "curl -sS -m 10 https://api.ipify.org; echo"
+          echo
+          echo "=== bare POST to api.zentropi.ai/v1/label FROM the EC2 (no key) — status + rate headers ==="
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP "curl -sS -m 15 -D - -o /dev/null -X POST https://api.zentropi.ai/v1/label -H 'content-type: application/json' -d '{}' 2>&1 | grep -iE 'HTTP/|retry-after|ratelimit|x-rate|cf-ray|429|too many|server:' || echo '(no matching headers)'"
+    env: {}
