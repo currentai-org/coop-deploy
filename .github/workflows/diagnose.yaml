@@ -1,7 +1,7 @@
 name: Diagnose (read-only)
 
-# READ-ONLY. Manual. SSH + docker exec cat|grep only. No up/down/restart/build. Dumps the signal
-# executor's retry-budget logic (the storm source) and where the budget value comes from.
+# READ-ONLY. Manual. SSH + docker logs/grep only. No up/down/restart/build. Reads cg-server logs to
+# confirm the recent Zentropi error status (429 vs other).
 
 on:
   workflow_dispatch: {}
@@ -30,13 +30,13 @@ jobs:
           echo "SERVER_IP=$SERVER_IP" >> "$GITHUB_ENV"
           terraform output -raw private_key > ../private_key.pem
           chmod 600 ../private_key.pem
-      - name: Dump signal executor retry-budget logic
+      - name: Read cg-server logs for recent Zentropi status
         run: |
           ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP '
             set +e
-            E=/app/services/orgAwareSignalExecutionService/signalExecutionService.js
-            echo "############ signalExecutionService.js (lines 1-190) ############"
-            sudo docker exec cg-server sed -n "1,190p" $E 2>/dev/null
-            echo; echo "############ where does the retry budget / count come from? (grep whole /app) ############"
-            sudo docker exec cg-server sh -c "grep -rnE \"retryBudget|retry_budget|maxRetries|numRetries|retries *[:=]|RETRY_|retryCount|budget\" /app/services/orgAwareSignalExecutionService /app/services/signalsService 2>/dev/null | grep -viE \"\.test\.|\.map\" | head -40"
+            echo "=== last 1500 log lines: Zentropi / 429 / rate / label / error matches ==="
+            sudo docker logs --tail 1500 cg-server 2>&1 | grep -iE "zentropi|429|rate.?limit|/v1/label|SignalPermanent|Zentropi API error|too many" | tail -40
+            echo
+            echo "=== count of Zentropi-error lines by status in that window ==="
+            sudo docker logs --tail 1500 cg-server 2>&1 | grep -oiE "Zentropi API error: [0-9]{3}[^\"]*" | sort | uniq -c | sort -rn | head
           '
