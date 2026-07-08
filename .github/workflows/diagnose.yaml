@@ -1,10 +1,9 @@
 name: Diagnose (read-only)
 
 # READ-ONLY diagnostic. Manually triggered. SSHes to the EC2 host with the same secrets the deploy
-# uses, then runs ONLY read commands (docker ps / inspect / logs, and `docker exec ... cat|grep|sed`
-# inside cg-server). It does NOT run `up`/`down`/`restart`/`--build` and changes NO container or config
-# state. Purpose: confirm whether the running cg-server actually has the patched zentropiUtils.js (the
-# 429/5xx no-retry block) or whether the read-only bind-mount went stale.
+# uses, then runs ONLY read commands (docker ps / inspect / logs / exec cat|grep|env). It does NOT run
+# up/down/restart/--build and changes NO container or config state. Purpose: locate the retry loop that
+# storms Zentropi on the async/inline signal-execution path.
 
 on:
   workflow_dispatch: {}
@@ -37,27 +36,22 @@ jobs:
           terraform output -raw private_key > ../private_key.pem
           chmod 600 ../private_key.pem
 
-      - name: Read-only container inspection
+      - name: Read-only signal-executor inspection
         run: |
-          PATCH=/app/services/signalsService/signals/third_party_signals/zentropi/zentropiUtils.js
-          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP "
+          ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$SERVER_IP '
             set +e
-            echo '=== container states ==='
-            sudo docker ps --format '{{.Names}}: {{.Status}}'
+            echo "=== integrations.config.json ==="
+            sudo docker exec cg-server cat /app/integrations.config.json 2>/dev/null | head -80
             echo
-            echo '=== HOST patch file: 429 block present? (expect >=1) ==='
-            grep -c '429 || response.status >= 500' coop/patches/zentropiUtils.js 2>/dev/null || echo 'host: MISSING/0'
-            echo '=== CONTAINER patch file: 429 block present? (expect >=1 if mount fresh) ==='
-            sudo docker exec cg-server grep -c '429 || response.status >= 500' $PATCH 2>/dev/null || echo 'container: MISSING/0 or exec failed'
+            echo "=== relevant runtime env (queue/retry/zentropi) ==="
+            sudo docker exec cg-server sh -c "env | grep -iE \"QUEUE|RETRY|ATTEMPT|BACKOFF|CONCURREN|ZENTROPI|SIGNAL\"" 2>/dev/null
             echo
-            echo '=== CONTAINER error-branch (lines 19-45) ==='
-            sudo docker exec cg-server sed -n '19,45p' $PATCH 2>/dev/null || echo '(cat failed)'
+            echo "=== files under /app/services that reference retry/attempts/backoff ==="
+            sudo docker exec cg-server sh -c "grep -rlniE \"maxRetries|numRetries|[^a-z]retries|backoff|attempts|retryable|p-retry|requeue\" /app/services /app/utils 2>/dev/null | head -20"
             echo
-            echo '=== cg-server mount source/inode ==='
-            sudo docker inspect cg-server --format '{{range .Mounts}}{{.Source}} -> {{.Destination}} (ro={{.RW | not}}){{\"\n\"}}{{end}}' 2>/dev/null
-            echo '=== cg-server created / started / restarts ==='
-            sudo docker inspect cg-server --format 'Created={{.Created}} StartedAt={{.State.StartedAt}} Restarts={{.RestartCount}} Running={{.State.Running}}' 2>/dev/null
+            echo "=== files that call the zentropi labeler / third-party signals ==="
+            sudo docker exec cg-server sh -c "grep -rlnE \"runZentropiLabelerImpl|getZentropiScores|third_party_signals|runLabeler|executeSignal|evaluateSignal\" /app/services 2>/dev/null | head -20"
             echo
-            echo '=== cg-server recent zentropi/429/error log lines ==='
-            sudo docker logs --tail 120 cg-server 2>&1 | grep -iE 'zentropi|429|rate.?limit|retry|error' | tail -25 || echo '(no matching log lines)'
-          "
+            echo "=== makeSignalPermanentError: definition + whether executor checks it ==="
+            sudo docker exec cg-server sh -c "grep -rnE \"makeSignalPermanentError|isPermanent|permanentError|shouldRetry|SignalPermanent\" /app/utils /app/services 2>/dev/null | head -30"
+          '
