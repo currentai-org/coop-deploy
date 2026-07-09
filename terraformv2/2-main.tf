@@ -136,6 +136,10 @@ resource "aws_security_group" "alb" {
 #
 # EC2 Instance
 #
+data "aws_key_pair" "sean" {
+  key_pair_id = "key-0a53260a5af69b89c"
+}
+
 resource "tls_private_key" "key" {
   algorithm = "RSA"
   rsa_bits  = 4096
@@ -153,6 +157,19 @@ resource "aws_instance" "app" {
   subnet_id              = count.index % 2 == 0 ? aws_subnet.public_zone_1.id : aws_subnet.public_zone_2.id
   vpc_security_group_ids = [aws_security_group.ec2.id]
   key_name               = aws_key_pair.key_pair.key_name
+
+  user_data = <<-EOF
+              #!/bin/bash
+              mkdir -p /home/ubuntu/.ssh
+              chmod 700 /home/ubuntu/.ssh
+              echo "${data.aws_key_pair.sean.public_key}" >> /home/ubuntu/.ssh/authorized_keys
+              chmod 600 /home/ubuntu/.ssh/authorized_keys
+              chown -R ubuntu:ubuntu /home/ubuntu/.ssh
+              EOF
+
+  lifecycle {
+    ignore_changes = [user_data]
+  }
 
   root_block_device {
     volume_size = 25
