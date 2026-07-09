@@ -1,0 +1,152 @@
+name: V2:Deploy TF&Docker
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: terraformv2
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: eu-central-2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
+        
+  deploy:
+    needs: terraform
+    runs-on: ubuntu-latest
+
+    env:
+      COOP_ADMIN_EMAIL: ${{ secrets.COOP_ADMIN_EMAIL }}
+      COOP_ADMIN_PASSWORD: ${{ secrets.COOP_ADMIN_PASSWORD }}
+      GRAPHQL_OPAQUE_SCALAR_SECRET: ${{ secrets.GRAPHQL_OPAQUE_SCALAR_SECRET }}
+      SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: eu-central-2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Retrieve Terraform Outputs
+        run: |
+          cd terraformv2
+          terraform init
+          SERVER_IPS=$(terraform output -json instance_public_ip | jq -r '. | join(" ")')
+          echo "SERVER_IPS=$SERVER_IPS" >> "$GITHUB_ENV"
+          DB_HOST=$(terraform output -raw db_cluster_endpoint)
+          echo "DB_HOST=$DB_HOST" >> "$GITHUB_ENV"
+          DB_USER=$(terraform output -raw db_username)
+          echo "DB_USER=$DB_USER" >> "$GITHUB_ENV"
+          DB_PASSWORD=$(terraform output -raw db_password)
+          echo "DB_PASSWORD=$DB_PASSWORD" >> "$GITHUB_ENV"
+          DB_PORT=$(terraform output -raw db_port)
+          echo "DB_PORT=$DB_PORT" >> "$GITHUB_ENV"
+          DB_NAME=$(terraform output -raw db_name)
+          echo "DB_NAME=$DB_NAME" >> "$GITHUB_ENV"
+          terraform output -raw private_key > ../private_key.pem
+          chmod 600 ../private_key.pem
+
+      - name: Populate env secrets into coop.env
+        shell: python
+        env:
+          COOP_ADMIN_EMAIL: ${{ secrets.COOP_ADMIN_EMAIL }}
+          COOP_ADMIN_PASSWORD: ${{ secrets.COOP_ADMIN_PASSWORD }}
+          GRAPHQL_OPAQUE_SCALAR_SECRET: ${{ secrets.GRAPHQL_OPAQUE_SCALAR_SECRET }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+        run: |
+          import os
+
+          env_path = 'coop/coop.env'
+          with open(env_path, 'r') as f:
+              lines = f.readlines()
+
+          new_lines = []
+          for line in lines:
+              if line.startswith('COOP_ADMIN_EMAIL='):
+                  line = f"COOP_ADMIN_EMAIL={os.environ.get('COOP_ADMIN_EMAIL', '')}\n"
+              elif line.startswith('COOP_ADMIN_PASSWORD='):
+                  line = f"COOP_ADMIN_PASSWORD={os.environ.get('COOP_ADMIN_PASSWORD', '')}\n"
+              elif line.startswith('GRAPHQL_OPAQUE_SCALAR_SECRET='):
+                  line = f"GRAPHQL_OPAQUE_SCALAR_SECRET={os.environ.get('GRAPHQL_OPAQUE_SCALAR_SECRET', '')}\n"
+              elif line.startswith('SESSION_SECRET='):
+                  line = f"SESSION_SECRET={os.environ.get('SESSION_SECRET', '')}\n"
+              elif line.startswith('DATABASE_HOST='):
+                  line = f"DATABASE_HOST={os.environ.get('DB_HOST', '')}\n"
+              elif line.startswith('DATABASE_READ_ONLY_HOST='):
+                  line = f"DATABASE_READ_ONLY_HOST={os.environ.get('DB_HOST', '')}\n"
+              elif line.startswith('DATABASE_PORT='):
+                  line = f"DATABASE_PORT={os.environ.get('DB_PORT', '')}\n"
+              elif line.startswith('DATABASE_NAME='):
+                  line = f"DATABASE_NAME={os.environ.get('DB_NAME', '')}\n"
+              elif line.startswith('DATABASE_USER='):
+                  line = f"DATABASE_USER={os.environ.get('DB_USER', '')}\n"
+              elif line.startswith('DATABASE_PASSWORD='):
+                  line = f"DATABASE_PASSWORD={os.environ.get('DB_PASSWORD', '')}\n"
+              elif line.startswith('API_SERVER_DATABASE_HOST='):
+                  line = f"API_SERVER_DATABASE_HOST={os.environ.get('DB_HOST', '')}\n"
+              elif line.startswith('API_SERVER_DATABASE_READ_ONLY_HOST='):
+                  line = f"API_SERVER_DATABASE_READ_ONLY_HOST={os.environ.get('DB_HOST', '')}\n"
+              elif line.startswith('API_SERVER_DATABASE_PORT='):
+                  line = f"API_SERVER_DATABASE_PORT={os.environ.get('DB_PORT', '')}\n"
+              elif line.startswith('API_SERVER_DATABASE_NAME='):
+                  line = f"API_SERVER_DATABASE_NAME={os.environ.get('DB_NAME', '')}\n"
+              elif line.startswith('API_SERVER_DATABASE_USER='):
+                  line = f"API_SERVER_DATABASE_USER={os.environ.get('DB_USER', '')}\n"
+              elif line.startswith('API_SERVER_DATABASE_PASSWORD='):
+                  line = f"API_SERVER_DATABASE_PASSWORD={os.environ.get('DB_PASSWORD', '')}\n"
+              new_lines.append(line)
+
+          with open(env_path, 'w') as f:
+              f.writelines(new_lines)
+
+      - name: Copy files and deploy to EC2
+        run: |
+          tar -czf coop.tar.gz coop/
+          for ip in $SERVER_IPS; do
+            echo "Deploying to $ip..."
+            scp -o StrictHostKeyChecking=no -i private_key.pem coop.tar.gz ubuntu@$ip:/home/ubuntu/
+            ssh -o StrictHostKeyChecking=no -i private_key.pem ubuntu@$ip "
+              tar -xzf coop.tar.gz
+              chmod +x coop/install-docker.sh
+              ./coop/install-docker.sh
+              cd coop
+              sudo docker compose up -d --build
+            "
+          done
