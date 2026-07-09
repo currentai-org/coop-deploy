@@ -36,25 +36,6 @@
 name: coop-guardrails
 
 services:
-  postgres:
-    image: postgres@sha256:8f70a8af16acc7c86e663ceda3dd95c41f036363c5b3c184650640ac20e7988b # postgres:15.18
-    container_name: cg-postgres
-    restart: unless-stopped
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-    ports:
-      # Host 5433 to avoid clashing with the chat app's own postgres on 5432.
-      # Internal stays 5432, so Coop's services (which use the Docker network) are
-      # unaffected. Connect from the host with: psql -h localhost -p 5433 -U postgres
-      - '${COOP_BIND_ADDR:-127.0.0.1}:5433:5432'
-    healthcheck:
-      test: ['CMD', 'pg_isready', '-U', 'postgres', '-d', 'postgres']
-      interval: 2s
-      start_period: 2s
-    environment:
-      POSTGRES_PASSWORD: postgres123
-      POSTGRES_USER: postgres
-      POSTGRES_DB: postgres
 
   redis:
     image: redis@sha256:315270d166080f537bbdf1b489b603aaaa213cb55a544acfa51feb7481abb1c0 # redis:8.6.1-trixie
@@ -111,8 +92,6 @@ services:
       && for db in api-server-pg scylla clickhouse; do npm run db:create -- --db "$$db" --env staging; npm run db:update -- --db "$$db" --env staging; done'
     env_file: ./coop.env
     depends_on:
-      postgres:
-        condition: service_healthy
       scylla:
         condition: service_healthy
       clickhouse:
@@ -233,7 +212,6 @@ services:
       - '${COOP_BIND_ADDR:-127.0.0.1}:9090:9090'
 
 volumes:
-  pg_data:
   redis_data:
   scylla_data:
   clickhouse_data:
