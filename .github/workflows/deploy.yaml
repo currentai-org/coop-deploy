@@ -1,9 +1,7 @@
-name: Deploy TF&Docker
+name: V1 Deploy TF&Docker
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 permissions:
   id-token: write
